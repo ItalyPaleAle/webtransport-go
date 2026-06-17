@@ -12,6 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// setSessionGoneGracePeriod overrides sessionGoneGracePeriod for the duration of
+// the test, restoring the previous value during cleanup.
+func setSessionGoneGracePeriod(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := sessionGoneGracePeriod
+	sessionGoneGracePeriod = d
+	t.Cleanup(func() { sessionGoneGracePeriod = old })
+}
+
 func newUniStreamPair(t *testing.T) (*quic.SendStream, *quic.ReceiveStream) {
 	t.Helper()
 
@@ -78,6 +87,7 @@ func TestSendStreamClose(t *testing.T) {
 }
 
 func TestSendStreamSessionGone(t *testing.T) {
+	setSessionGoneGracePeriod(t, time.Hour)
 	sendStr, recvStr := newUniStreamPair(t)
 	str := newSendStream(sendStr, nil, func() {})
 
@@ -113,6 +123,7 @@ func TestSendStreamSessionGone(t *testing.T) {
 
 func TestSendStreamSessionGoneDeadline(t *testing.T) {
 	t.Run("deadline expires while waiting", func(t *testing.T) {
+		setSessionGoneGracePeriod(t, time.Hour)
 		sendStr, recvStr := newUniStreamPair(t)
 		str := newSendStream(sendStr, nil, func() {})
 
@@ -139,6 +150,7 @@ func TestSendStreamSessionGoneDeadline(t *testing.T) {
 	})
 
 	t.Run("deadline changed while waiting", func(t *testing.T) {
+		setSessionGoneGracePeriod(t, time.Hour)
 		sendStr, recvStr := newUniStreamPair(t)
 		str := newSendStream(sendStr, nil, func() {})
 
@@ -173,6 +185,7 @@ func TestSendStreamSessionGoneDeadline(t *testing.T) {
 }
 
 func TestReceiveStreamSessionGone(t *testing.T) {
+	setSessionGoneGracePeriod(t, time.Hour)
 	sendStr, recvStr := newUniStreamPair(t)
 	str := newReceiveStream(recvStr, func() {})
 
@@ -204,6 +217,7 @@ func TestReceiveStreamSessionGone(t *testing.T) {
 }
 
 func TestReceiveStreamReadDuringSessionGoneAndCloseSession(t *testing.T) {
+	setSessionGoneGracePeriod(t, time.Hour)
 	sendStr, recvStr := newUniStreamPair(t)
 
 	sm := newStreamsMap()
@@ -240,6 +254,7 @@ func TestReceiveStreamReadDuringSessionGoneAndCloseSession(t *testing.T) {
 
 func TestReceiveStreamSessionGoneDeadline(t *testing.T) {
 	t.Run("deadline expires while waiting", func(t *testing.T) {
+		setSessionGoneGracePeriod(t, time.Hour)
 		sendStr, recvStr := newUniStreamPair(t)
 		str := newReceiveStream(recvStr, func() {})
 
@@ -263,6 +278,7 @@ func TestReceiveStreamSessionGoneDeadline(t *testing.T) {
 	})
 
 	t.Run("deadline changed while waiting", func(t *testing.T) {
+		setSessionGoneGracePeriod(t, time.Hour)
 		sendStr, recvStr := newUniStreamPair(t)
 		str := newReceiveStream(recvStr, func() {})
 
@@ -328,6 +344,7 @@ func TestSendStreamHeaderRetryAfterDeadlineError(t *testing.T) {
 }
 
 func TestSendStreamWriteDuringSessionGoneAndCloseSession(t *testing.T) {
+	setSessionGoneGracePeriod(t, time.Hour)
 	sendStr, recvStr := newUniStreamPair(t)
 
 	sm := newStreamsMap()
@@ -364,6 +381,67 @@ func TestSendStreamWriteDuringSessionGoneAndCloseSession(t *testing.T) {
 		require.ErrorIs(t, err, sessionErr)
 	case <-time.After(scaleDuration(time.Second)):
 		t.Fatal("Write() should not hang after CloseSession()")
+	}
+}
+
+func TestReceiveStreamSessionGoneGracePeriod(t *testing.T) {
+	// The peer resets the stream with WT_SESSION_GONE but never delivers the
+	// WT_CLOSE_SESSION capsule (s.closed never fires) and no read deadline is
+	// set. Read must not block indefinitely: after the grace period it returns
+	// a session-gone error.
+	setSessionGoneGracePeriod(t, scaleDuration(20*time.Millisecond))
+
+	sendStr, recvStr := newUniStreamPair(t)
+	str := newReceiveStream(recvStr, func() {})
+
+	// simulate remote side sending WTSessionGoneErrorCode
+	sendStr.CancelWrite(WTSessionGoneErrorCode)
+
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := str.Read(make([]byte, 100))
+		errChan <- err
+	}()
+
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, &SessionError{Remote: true})
+		var sessErr *SessionError
+		require.ErrorAs(t, err, &sessErr)
+		require.True(t, sessErr.Remote)
+	case <-time.After(scaleDuration(2 * time.Second)):
+		t.Fatal("Read should have unblocked after the grace period")
+	}
+}
+
+func TestSendStreamSessionGoneGracePeriod(t *testing.T) {
+	// Same as above, but for the write direction.
+	setSessionGoneGracePeriod(t, scaleDuration(20*time.Millisecond))
+
+	sendStr, recvStr := newUniStreamPair(t)
+	str := newSendStream(sendStr, nil, func() {})
+
+	// simulate remote side sending WTSessionGoneErrorCode
+	recvStr.CancelRead(WTSessionGoneErrorCode)
+
+	errChan := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := str.Write([]byte("foo")); err != nil {
+				errChan <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	select {
+	case err := <-errChan:
+		var sessErr *SessionError
+		require.ErrorAs(t, err, &sessErr)
+		require.True(t, sessErr.Remote)
+	case <-time.After(scaleDuration(2 * time.Second)):
+		t.Fatal("Write should have unblocked after the grace period")
 	}
 }
 
